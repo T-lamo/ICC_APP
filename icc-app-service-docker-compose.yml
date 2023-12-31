@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  icc-mla-service:
+    build: ./ICC_MLA_SERVICE
+    ports:
+      - 3000:3000
+  
+  icc-ng-front:
+    build: ./ICCNG
+    ports:
+      - 4200:4200
+  
+  reverse_proxy:
+    build:
+      context: ./reverse_proxy
+      dockerfile: Dockerfile
+    ports:
+      - 80:80
