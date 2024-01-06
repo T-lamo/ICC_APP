@@ -1,0 +1,202 @@
+name: Docker Build and Push
+
+on:
+  push:
+    branches:
+      - develop
+
+jobs:
+  
+  mla-service-instance-group:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup GCP
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}' # Replace with the name of your GitHub Actions secret
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_email: ${{ secrets.GCP_SA_EMAIL }}
+
+
+      - name: Configure Docker CLI
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > 'keyfile.json' && gcloud auth activate-service-account --key-file='keyfile.json' && gcloud auth configure-docker
+
+      - name: Build and Push Mla Service Docker image
+        working-directory: ICC_MLA_SERVICE
+        run: |
+          docker build -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.MLA_SERVICE_IMAGE }} .
+          docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.MLA_SERVICE_IMAGE }}
+
+    
+      - name: Create GCP Mla Service MIG
+        run: |
+          gcloud compute instance-templates create-with-container mla-service-instance-template \
+            --container-image gcr.io/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.MLA_SERVICE_IMAGE }} \
+            --machine-type e2-micro \
+            --boot-disk-size 10GB \
+            --tags http-8080
+
+      - name: Create GCP Mla Service Instance Group
+        run: |
+          # Create the managed instance group
+          gcloud compute instance-groups managed create mla-service-instance-group \
+            --template mla-service-instance-template \
+            --zone us-central1-a \
+            --size 1
+      
+          # Set named ports for the instance group
+          gcloud compute instance-groups set-named-ports mla-service-instance-group \
+            --named-ports http-8080:8080 \
+            --zone us-central1-a
+
+  iccng-instance-group:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Setup GCP
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}' # Replace with the name of your GitHub Actions secret
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_email: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: Configure Docker CLI
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > 'keyfile.json' && gcloud auth activate-service-account --key-file='keyfile.json' && gcloud auth configure-docker
+
+      - name: Build and Push iccng  Docker image
+        working-directory: ICCNG
+        run: |
+          docker build -t gcr.io/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ICCNG_IMAGE }} .
+          docker push gcr.io/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ICCNG_IMAGE }}
+
+      - name: Create GCP ICCNG MIG
+        run: |
+          gcloud compute instance-templates create-with-container iccng-instance-template-v2 \
+            --container-image gcr.io/${{ secrets.GCP_PROJECT_ID }}/${{ secrets.ICCNG_IMAGE }} \
+            --machine-type e2-micro \
+            --boot-disk-size 10GB \
+            --tags http-server
+
+      - name: Create GCP ICCNG Instance Group
+        run: |
+          gcloud compute instance-groups managed  create iccng-instance-group \
+            --template iccng-instance-template-v2 \
+            --zone us-central1-a \
+            --size 1
+
+          gcloud compute instance-groups set-named-ports iccng-instance-group  \
+            --named-ports http-80:80 \
+            --zone us-central1-a
+        
+  
+
+  create-http-load-balancer:
+    runs-on: ubuntu-latest
+    needs:
+      - mla-service-instance-group
+      - iccng-instance-group
+  
+    steps:
+      - name: Setup GCP
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          service_account_email: ${{ secrets.GCP_SA_EMAIL }}
+
+      - name: GCP Auth
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > 'keyfile.json' && gcloud auth activate-service-account --key-file='keyfile.json'
+
+
+      - name: Create HTTP(S) Load Balancer
+        run: |
+
+                  
+      - name: Create MLA Health  Check
+        run: |
+          gcloud compute health-checks create tcp global-healthcheck-8080 \
+          --port=8080 
+
+      - name: Create Backend mla Service
+        run: |
+          gcloud compute backend-services create mla-backend \
+            --protocol=HTTP \
+            --global \
+            --port-name http-8080 \
+            --load-balancing-scheme=EXTERNAL_MANAGED \
+            --health-checks=global-healthcheck-8080 
+      
+          gcloud compute backend-services add-backend mla-backend \
+            --instance-group mla-service-instance-group \
+            --capacity-scaler 1 \
+            --instance-group-zone us-central1-a\
+            --max-utilization=0.8 \
+            --global
+
+
+      - name: Create Iccng Health  Check
+        run: |
+          gcloud compute health-checks create tcp global-healthcheck-80 \
+          --port=80 
+      
+
+      - name: Create Backend ICCNG Service
+        run: |
+          gcloud compute backend-services create iccng-backend \
+            --protocol=HTTP \
+            --global \
+            --port-name http-80 \
+            --load-balancing-scheme=EXTERNAL_MANAGED \
+            --health-checks=global-healthcheck-80 
+      
+          gcloud compute backend-services add-backend iccng-backend \
+            --instance-group iccng-instance-group \
+            --capacity-scaler 1 \
+            --instance-group-zone us-central1-a\
+            --max-utilization=0.8 \
+            --global
+
+
+ 
+
+      - name: Create URL Map
+        run: |
+          gcloud compute url-maps create icc-load-balancer \
+            --default-service iccng-backend \
+            
+      - name: Add Path Matcher
+        run: |
+          gcloud compute url-maps add-path-matcher icc-load-balancer \
+            --path-matcher-name my-matcher \
+            --default-service iccng-backend \
+            --backend-service-path-rules='/mla/*=mla-backend,/mla=mla-backend'
+
+      - name: Create Target HTTP Proxy
+        run: |
+          gcloud compute target-http-proxies create icc-load-balancer-target-proxy \
+            --url-map icc-load-balancer
+
+
+
+      - name: Create Forwarding Rule
+        run: |
+          gcloud compute forwarding-rules create icc-load-balancer-forwarding-rule \
+            --load-balancing-scheme=EXTERNAL_MANAGED \
+            --network-tier=PREMIUM \
+            --ports=80 \
+            --global \
+            --target-http-proxy icc-load-balancer-target-proxy
+
+
+
+
+
+
+
